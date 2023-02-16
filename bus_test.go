@@ -154,9 +154,9 @@ func TestChannelBus_NonBlockOnFullBuffer(t *testing.T) {
 	}
 	assert.Equal(t, 5, n, "only receive 5 copies on sub1")
 	assert.Equal(t, 10, n2, "all 10 on sub2")
-	assert.Equal(t, 5, sub1.ErrCnt, "Err count is correct")
-	assert.Equal(t, bufio.ErrBufferFull, sub1.Err)
-	assert.Equal(t, 0, sub2.ErrCnt, "Err count is correct")
+	assert.EqualValues(t, 5, sub1.ErrCnt(), "Err count is correct")
+	assert.EqualValues(t, bufio.ErrBufferFull, sub1.Err())
+	assert.EqualValues(t, 0, sub2.ErrCnt(), "Err count is correct")
 }
 
 func addBenchSubscriber(bus *ChannelBus[string], topic string) (*Subscription[string], *atomic.Int64, chan bool) {
@@ -277,7 +277,7 @@ func testPubSub(b *testing.B, nSub int, subjects []string, waitAsync bool) {
 			done := true
 			for i, val := range exp {
 				// Check for expected still > act + errors  - with this rate of publication there may be some drops
-				if int64(val) > counts[i].Load()+int64(subs[i].ErrCnt) {
+				if int64(val) > counts[i].Load()+subs[i].ErrCnt() {
 					done = false
 				}
 			}

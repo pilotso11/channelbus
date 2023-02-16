@@ -25,6 +25,7 @@ package channelbus
 import (
 	"bufio"
 	"sync"
+	"sync/atomic"
 )
 
 // Subscription holds the subscription details.  Use it to listen on Ch and unsubscribe.
@@ -35,9 +36,23 @@ type Subscription[T any] struct {
 	// The channel to listen on
 	Ch chan T
 	// Count of errors received on the channel
-	ErrCnt int
+	errCnt atomic.Int64
 	// The most recent error on the channel
-	Err error
+	err atomic.Value
+}
+
+// ErrCnt is the count of errors received on the channel
+func (s *Subscription[T]) ErrCnt() int64 {
+	return s.errCnt.Load()
+}
+
+// Err is the most recent error on the channel
+func (s *Subscription[T]) Err() (err error) {
+	val := s.err.Load()
+	if val != nil {
+		return val.(error)
+	}
+	return
 }
 
 type ChannelBus[T any] struct {
@@ -104,8 +119,8 @@ func (b *ChannelBus[T]) Publish(topic string, msg T) (n int) {
 				n++ // increment number sent
 			default:
 				// Channel is either not being listened to or the buffer is full, record the error and continue
-				sub.ErrCnt++
-				sub.Err = bufio.ErrBufferFull
+				sub.errCnt.Add(1)
+				sub.err.Store(bufio.ErrBufferFull)
 			}
 		}
 	}
