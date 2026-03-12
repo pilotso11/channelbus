@@ -73,7 +73,7 @@ type unboundedState[T any] struct {
 	buf      []T
 	notifyCh chan struct{} // signals the drain goroutine that buf has items
 	closed   atomic.Bool
-	depth    atomic.Int64 // current buffer depth (atomic for reads without lock)
+	depth    atomic.Int64 // current buffer depth (atomic for lock-free reads)
 	peak     atomic.Int64 // peak buffer depth ever observed
 
 	config UnboundedConfig[T]
@@ -97,9 +97,11 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	if u.config.MaxBufferSize > 0 && len(u.buf) >= u.config.MaxBufferSize {
 		switch u.config.DropPolicy {
 		case DropOldest:
-			// Remove oldest, append new
-			u.buf = u.buf[1:]
-			u.buf = append(u.buf, msg)
+			// Copy to a new slice so the old backing array can be GC'd
+			newBuf := make([]T, len(u.buf)-1, len(u.buf))
+			copy(newBuf, u.buf[1:])
+			u.buf = append(newBuf, msg)
+			u.depth.Store(int64(len(u.buf)))
 			u.mu.Unlock()
 			u.sub.errCnt.Add(1)
 			return true
@@ -112,10 +114,10 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 
 	u.buf = append(u.buf, msg)
 	currentDepth := int64(len(u.buf))
+	u.depth.Store(currentDepth)
 	u.mu.Unlock()
 
-	// Update atomic counters
-	u.depth.Store(currentDepth)
+	// Update peak (lock-free CAS loop)
 	for {
 		oldPeak := u.peak.Load()
 		if currentDepth <= oldPeak || u.peak.CompareAndSwap(oldPeak, currentDepth) {
@@ -150,29 +152,29 @@ func (u *unboundedState[T]) drain() {
 			return
 		}
 
-		// Drain all available messages
+		// Drain all available messages in batches to reduce lock contention.
 		for {
+			// Grab all pending messages in one lock acquisition
 			u.mu.Lock()
 			if len(u.buf) == 0 {
 				u.mu.Unlock()
 				break
 			}
-			msg := u.buf[0]
-			u.buf[0] = *new(T) // zero out for GC
-			u.buf = u.buf[1:]
-			currentDepth := int64(len(u.buf))
+			batch := u.buf
+			u.buf = nil
+			u.depth.Store(0)
 			u.mu.Unlock()
 
-			u.depth.Store(currentDepth)
-
-			// Reset slow consumer flag when depth drops back below threshold
+			// Reset slow consumer flag when depth drops below threshold
 			threshold := u.config.SlowConsumerThreshold
-			if threshold > 0 && currentDepth < int64(threshold) {
+			if threshold > 0 {
 				u.slowConsumerTriggered.Store(false)
 			}
 
-			// Blocking send to sub.Ch — the consumer reads from here
-			u.sub.Ch <- msg
+			// Send each message to the consumer (blocking — backpressure is intentional)
+			for _, msg := range batch {
+				u.sub.Ch <- msg
+			}
 		}
 	}
 }

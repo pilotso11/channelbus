@@ -14,6 +14,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// drainChan reads all available messages from ch until no message arrives within timeout.
+func drainChan[T any](ch <-chan T, timeout time.Duration) []T {
+	var result []T
+	for {
+		select {
+		case msg := <-ch:
+			result = append(result, msg)
+		case <-time.After(timeout):
+			return result
+		}
+	}
+}
+
 func TestSubscribeUnbounded_BasicDelivery(t *testing.T) {
 	bus := NewChannelBus[string]()
 	sub := bus.SubscribeUnbounded("test.")
@@ -71,15 +84,15 @@ func TestSubscribeUnbounded_MixedWithBounded(t *testing.T) {
 
 	// Bounded should have dropped some
 	boundedCount := 0
+drain:
 	for {
 		select {
 		case <-bounded.Ch:
 			boundedCount++
 		default:
-			goto doneBounded
+			break drain
 		}
 	}
-doneBounded:
 	assert.Equal(t, 5, boundedCount, "bounded should only have 5")
 	assert.EqualValues(t, 15, bounded.ErrCnt(), "bounded should have 15 drops")
 
@@ -166,16 +179,7 @@ func TestSubscribeUnbounded_MaxBufferSize_DropNewest(t *testing.T) {
 	}, 1*time.Second, 5*time.Millisecond, "should have drops")
 
 	// Read what we can — should be first 10 (plus maybe 1 in Ch buffer)
-	var received []int
-	for {
-		select {
-		case msg := <-sub.Ch:
-			received = append(received, msg)
-		case <-time.After(500 * time.Millisecond):
-			goto done
-		}
-	}
-done:
+	received := drainChan(sub.Ch, 500*time.Millisecond)
 	// The first messages should be the earliest ones (0, 1, 2, ...)
 	require.NotEmpty(t, received)
 	assert.Equal(t, 0, received[0], "first received should be oldest message")
@@ -201,16 +205,7 @@ func TestSubscribeUnbounded_MaxBufferSize_DropOldest(t *testing.T) {
 	}, 1*time.Second, 5*time.Millisecond, "should have drops")
 
 	// Read all — the newest messages should be present
-	var received []int
-	for {
-		select {
-		case msg := <-sub.Ch:
-			received = append(received, msg)
-		case <-time.After(500 * time.Millisecond):
-			goto done
-		}
-	}
-done:
+	received := drainChan(sub.Ch, 500*time.Millisecond)
 	require.NotEmpty(t, received)
 	// Last received should be 19 (the newest)
 	assert.Equal(t, 19, received[len(received)-1], "last received should be newest message")
