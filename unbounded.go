@@ -157,19 +157,20 @@ func (u *unboundedState[T]) drain() {
 			// Grab all pending messages in one lock acquisition
 			u.mu.Lock()
 			if len(u.buf) == 0 {
+				u.depth.Store(0)
 				u.mu.Unlock()
+
+				// Reset slow consumer flag once buffer is fully empty
+				threshold := u.config.SlowConsumerThreshold
+				if threshold > 0 {
+					u.slowConsumerTriggered.Store(false)
+				}
 				break
 			}
 			batch := u.buf
 			u.buf = nil
 			u.depth.Store(0)
 			u.mu.Unlock()
-
-			// Reset slow consumer flag when depth drops below threshold
-			threshold := u.config.SlowConsumerThreshold
-			if threshold > 0 {
-				u.slowConsumerTriggered.Store(false)
-			}
 
 			// Send each message to the consumer (blocking — backpressure is intentional)
 			for _, msg := range batch {

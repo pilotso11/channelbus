@@ -247,14 +247,22 @@ func TestSubscribeUnbounded_BufferDepthAndPeak(t *testing.T) {
 	assert.GreaterOrEqual(t, sub.PeakBufferDepth(), 45)
 }
 
-func TestSubscribeUnbounded_BoundedBufferDepthIsZero(t *testing.T) {
+func TestSubscribeUnbounded_BoundedBufferDepthIsLenCh(t *testing.T) {
 	bus := NewChannelBus[string]()
-	sub := bus.Subscribe("test.")
+	sub := bus.Subscribe("test.", 10)
 	defer bus.Unsubscribe(sub)
 
 	assert.False(t, sub.IsUnbounded())
 	assert.Equal(t, 0, sub.BufferDepth())
-	assert.Equal(t, 0, sub.PeakBufferDepth())
+
+	bus.Publish("test.msg", "a")
+	bus.Publish("test.msg", "b")
+	assert.Equal(t, 2, sub.BufferDepth())
+
+	<-sub.Ch
+	assert.Equal(t, 1, sub.BufferDepth())
+
+	assert.Equal(t, 0, sub.PeakBufferDepth()) // peak only tracked for unbounded
 }
 
 func TestSubscribeUnbounded_UnsubscribeStopsDrain(t *testing.T) {

@@ -58,11 +58,13 @@ func (s *Subscription[T]) Err() (err error) {
 	return
 }
 
-// BufferDepth returns the current internal buffer depth for unbounded
-// subscriptions. Returns 0 for bounded subscriptions.
+// BufferDepth returns the current buffer depth.
+// For bounded subscriptions this is len(Ch).
+// For unbounded subscriptions this is the internal buffer depth
+// (messages waiting to be drained into Ch).
 func (s *Subscription[T]) BufferDepth() int {
 	if s.unbounded == nil {
-		return 0
+		return len(s.Ch)
 	}
 	return int(s.unbounded.depth.Load())
 }
