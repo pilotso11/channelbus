@@ -42,8 +42,8 @@ const (
 
 // SlowConsumerFunc is called when an unbounded subscription's internal buffer
 // depth crosses the SlowConsumerThreshold. It receives the subscription (for
-// identification) and the current buffer depth. The callback is invoked from
-// the Publish goroutine and must not block.
+// identification) and the current buffer depth. The callback is invoked in
+// a separate goroutine and will not block publishers.
 type SlowConsumerFunc[T any] func(sub *Subscription[T], depth int)
 
 // UnboundedConfig configures an unbounded subscription.
@@ -63,9 +63,9 @@ type UnboundedConfig[T any] struct {
 	DropPolicy DropPolicy
 
 	// OnSlowConsumer is called when the buffer depth exceeds
-	// SlowConsumerThreshold. Called from the Publish goroutine;
-	// must not block. May be called multiple times (each time depth
-	// crosses the threshold after dropping back below it).
+	// SlowConsumerThreshold. Called in a separate goroutine so it
+	// will not block publishers. May be called multiple times (each
+	// time depth crosses the threshold after dropping back below it).
 	OnSlowConsumer SlowConsumerFunc[T]
 }
 
@@ -106,12 +106,10 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 			newBuf := make([]T, len(u.buf)-1, len(u.buf))
 			copy(newBuf, u.buf[1:])
 			u.buf = append(newBuf, msg)
-			// Capture depth inside mutex to avoid stale-write race with drain goroutine
-			depth := int64(len(u.buf))
-			u.depth.Store(depth)
+			depth := u.updateDepthAndPeak()
 			u.mu.Unlock()
 			u.sub.errCnt.Add(1)
-			u.updatePeakAndNotify(depth)
+			u.notifyAndCheckSlowConsumer(depth)
 			return true
 		case DropNewest:
 			u.mu.Unlock()
@@ -121,40 +119,41 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	}
 
 	u.buf = append(u.buf, msg)
-	// Capture depth inside mutex to avoid stale-write race with drain goroutine
-	depth := int64(len(u.buf))
-	u.depth.Store(depth)
+	depth := u.updateDepthAndPeak()
 	u.mu.Unlock()
 
-	u.updatePeakAndNotify(depth)
+	u.notifyAndCheckSlowConsumer(depth)
 	return true
 }
 
-// updatePeakAndNotify updates the peak depth, checks for slow consumers, and
-// signals the drain goroutine. Called after enqueue adds a message to the buffer.
-// depth is the buffer length captured inside the mutex.
-func (u *unboundedState[T]) updatePeakAndNotify(depth int64) {
-	// Update peak (lock-free CAS loop)
-	for {
-		oldPeak := u.peak.Load()
-		if depth <= oldPeak || u.peak.CompareAndSwap(oldPeak, depth) {
-			break
-		}
+// updateDepthAndPeak updates depth and peak atomics from the current buffer length.
+// Must be called while u.mu is held.
+func (u *unboundedState[T]) updateDepthAndPeak() int64 {
+	depth := int64(len(u.buf))
+	u.depth.Store(depth)
+	if depth > u.peak.Load() {
+		u.peak.Store(depth)
 	}
+	return depth
+}
 
-	// Slow consumer detection
-	threshold := u.config.SlowConsumerThreshold
-	if threshold > 0 && depth >= int64(threshold) {
-		if u.config.OnSlowConsumer != nil && !u.slowConsumerTriggered.Load() {
-			u.slowConsumerTriggered.Store(true)
-			u.config.OnSlowConsumer(u.sub, int(depth))
-		}
-	}
-
+// notifyAndCheckSlowConsumer signals the drain goroutine and fires the slow
+// consumer callback if the threshold is exceeded. Called outside the mutex;
+// the callback contract says it must not block.
+func (u *unboundedState[T]) notifyAndCheckSlowConsumer(depth int64) {
 	// Non-blocking signal to drain goroutine
 	select {
 	case u.notifyCh <- struct{}{}:
 	default:
+	}
+
+	// Slow consumer detection — fire callback in a goroutine so a
+	// misbehaving callback can never block the Publish path.
+	threshold := u.config.SlowConsumerThreshold
+	if threshold > 0 && depth >= int64(threshold) {
+		if u.config.OnSlowConsumer != nil && u.slowConsumerTriggered.CompareAndSwap(false, true) {
+			go u.config.OnSlowConsumer(u.sub, int(depth))
+		}
 	}
 }
 
