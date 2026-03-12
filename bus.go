@@ -2,7 +2,7 @@ package channelbus
 
 // MIT License
 //
-// Copyright (c) 2023 Seth Osher
+// Copyright (c) 2023-2026 Seth Osher
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -39,6 +39,9 @@ type Subscription[T any] struct {
 	errCnt atomic.Int64
 	// The most recent error on the channel
 	err atomic.Value
+
+	// unbounded holds the internal state for unbounded subscriptions (nil for bounded).
+	unbounded *unboundedState[T]
 }
 
 // ErrCnt is the count of errors received on the channel
@@ -53,6 +56,43 @@ func (s *Subscription[T]) Err() (err error) {
 		return val.(error)
 	}
 	return
+}
+
+// BufferDepth returns the current buffer depth.
+// For bounded subscriptions this is len(Ch).
+// For unbounded subscriptions this is the internal buffer depth
+// (messages waiting to be drained into Ch).
+func (s *Subscription[T]) BufferDepth() int {
+	if s.unbounded == nil {
+		return len(s.Ch)
+	}
+	return int(s.unbounded.depth.Load())
+}
+
+// PeakBufferDepth returns the highest internal buffer depth ever observed.
+// Only tracked for unbounded subscriptions; returns 0 for bounded
+// (tracking peak for bounded would add overhead to the zero-allocation publish path).
+func (s *Subscription[T]) PeakBufferDepth() int {
+	if s.unbounded == nil {
+		return 0
+	}
+	return int(s.unbounded.peak.Load())
+}
+
+// IsUnbounded returns true if this subscription uses an unbounded internal buffer.
+func (s *Subscription[T]) IsUnbounded() bool {
+	return s.unbounded != nil
+}
+
+// Close stops the internal drain goroutine for unbounded subscriptions and
+// waits for it to exit. After Close returns, no new publishes are accepted
+// and no further sends to Ch will occur. Already-buffered messages that have
+// not been drained are discarded. For bounded subscriptions this is a no-op.
+// Close is idempotent.
+func (s *Subscription[T]) Close() {
+	if s.unbounded != nil {
+		s.unbounded.close()
+	}
 }
 
 type ChannelBus[T any] struct {
@@ -80,28 +120,34 @@ func (b *ChannelBus[T]) Subscribe(topic string, bufferSize ...int) *Subscription
 		bufSize = bufferSize[0]
 	}
 	// Create the new subscription, with a buffer size of 100
-	sub := Subscription[T]{
+	sub := &Subscription[T]{
 		Prefix: topic,
 		Ch:     make(chan T, bufSize),
 	}
 	// Save it in the list
-	b.subs = append(b.subs, &sub)
+	b.subs = append(b.subs, sub)
 
-	return &sub
+	return sub
 }
 
 // Unsubscribe removes an existing subscription.  It returns true if a subscription was found and removed.
+// For unbounded subscriptions, this also stops the internal drain goroutine.
 func (b *ChannelBus[T]) Unsubscribe(subscription *Subscription[T]) bool {
 	b.lock.Lock()
-	defer b.lock.Unlock()
-
-	// Remove the subscription from the list
+	// Remove the subscription from the list while holding the lock
 	newSubs := remove(b.subs, subscription)
-	if len(newSubs) < len(b.subs) {
+	found := len(newSubs) < len(b.subs)
+	if found {
 		b.subs = newSubs
-		return true
 	}
-	return false
+	b.lock.Unlock()
+
+	// Close outside the lock so the drain goroutine's shutdown
+	// doesn't block concurrent Publish/Subscribe calls.
+	if found {
+		subscription.Close()
+	}
+	return found
 }
 
 // Publish a message of type T to all subscribers channels whose Prefix matches topic.
@@ -114,13 +160,21 @@ func (b *ChannelBus[T]) Publish(topic string, msg T) (n int) {
 	for _, sub := range b.subs {
 		// Prefix match the topic
 		if match(topic, sub.Prefix) {
-			select {
-			case sub.Ch <- msg:
-				n++ // increment number sent
-			default:
-				// Channel is either not being listened to or the buffer is full, record the error and continue
-				sub.errCnt.Add(1)
-				sub.err.Store(bufio.ErrBufferFull)
+			if sub.unbounded != nil {
+				// Unbounded: route through internal buffer
+				if sub.unbounded.enqueue(msg) {
+					n++
+				}
+			} else {
+				// Bounded: non-blocking send directly to channel
+				select {
+				case sub.Ch <- msg:
+					n++ // increment number sent
+				default:
+					// Channel is either not being listened to or the buffer is full, record the error and continue
+					sub.errCnt.Add(1)
+					sub.err.Store(bufio.ErrBufferFull)
+				}
 			}
 		}
 	}
