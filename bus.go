@@ -2,7 +2,7 @@ package channelbus
 
 // MIT License
 //
-// Copyright (c) 2023 Seth Osher
+// Copyright (c) 2023-2026 Seth Osher
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -39,6 +39,9 @@ type Subscription[T any] struct {
 	errCnt atomic.Int64
 	// The most recent error on the channel
 	err atomic.Value
+
+	// unbounded holds the internal state for unbounded subscriptions (nil for bounded).
+	unbounded *unboundedState[T]
 }
 
 // ErrCnt is the count of errors received on the channel
@@ -53,6 +56,38 @@ func (s *Subscription[T]) Err() (err error) {
 		return val.(error)
 	}
 	return
+}
+
+// BufferDepth returns the current internal buffer depth for unbounded
+// subscriptions. Returns 0 for bounded subscriptions.
+func (s *Subscription[T]) BufferDepth() int {
+	if s.unbounded == nil {
+		return 0
+	}
+	return int(s.unbounded.depth.Load())
+}
+
+// PeakBufferDepth returns the highest buffer depth ever observed for unbounded
+// subscriptions. Returns 0 for bounded subscriptions.
+func (s *Subscription[T]) PeakBufferDepth() int {
+	if s.unbounded == nil {
+		return 0
+	}
+	return int(s.unbounded.peak.Load())
+}
+
+// IsUnbounded returns true if this subscription uses an unbounded internal buffer.
+func (s *Subscription[T]) IsUnbounded() bool {
+	return s.unbounded != nil
+}
+
+// Close stops the internal drain goroutine for unbounded subscriptions.
+// For bounded subscriptions this is a no-op. Close is idempotent.
+// After Close, the subscription should not receive new messages.
+func (s *Subscription[T]) Close() {
+	if s.unbounded != nil {
+		s.unbounded.close()
+	}
 }
 
 type ChannelBus[T any] struct {
@@ -80,17 +115,18 @@ func (b *ChannelBus[T]) Subscribe(topic string, bufferSize ...int) *Subscription
 		bufSize = bufferSize[0]
 	}
 	// Create the new subscription, with a buffer size of 100
-	sub := Subscription[T]{
+	sub := &Subscription[T]{
 		Prefix: topic,
 		Ch:     make(chan T, bufSize),
 	}
 	// Save it in the list
-	b.subs = append(b.subs, &sub)
+	b.subs = append(b.subs, sub)
 
-	return &sub
+	return sub
 }
 
 // Unsubscribe removes an existing subscription.  It returns true if a subscription was found and removed.
+// For unbounded subscriptions, this also stops the internal drain goroutine.
 func (b *ChannelBus[T]) Unsubscribe(subscription *Subscription[T]) bool {
 	b.lock.Lock()
 	defer b.lock.Unlock()
@@ -99,6 +135,7 @@ func (b *ChannelBus[T]) Unsubscribe(subscription *Subscription[T]) bool {
 	newSubs := remove(b.subs, subscription)
 	if len(newSubs) < len(b.subs) {
 		b.subs = newSubs
+		subscription.Close()
 		return true
 	}
 	return false
@@ -114,13 +151,21 @@ func (b *ChannelBus[T]) Publish(topic string, msg T) (n int) {
 	for _, sub := range b.subs {
 		// Prefix match the topic
 		if match(topic, sub.Prefix) {
-			select {
-			case sub.Ch <- msg:
-				n++ // increment number sent
-			default:
-				// Channel is either not being listened to or the buffer is full, record the error and continue
-				sub.errCnt.Add(1)
-				sub.err.Store(bufio.ErrBufferFull)
+			if sub.unbounded != nil {
+				// Unbounded: route through internal buffer
+				if sub.unbounded.enqueue(msg) {
+					n++
+				}
+			} else {
+				// Bounded: non-blocking send directly to channel
+				select {
+				case sub.Ch <- msg:
+					n++ // increment number sent
+				default:
+					// Channel is either not being listened to or the buffer is full, record the error and continue
+					sub.errCnt.Add(1)
+					sub.err.Store(bufio.ErrBufferFull)
+				}
 			}
 		}
 	}

@@ -59,6 +59,51 @@ func main() {
 ```
 
 
+# Unbounded Subscriptions
+
+For consumers that must never miss a message, `SubscribeUnbounded` provides an internal
+growing buffer between the publisher and the subscription channel. Messages are never dropped
+due to a full channel buffer (unless a hard limit is configured).
+
+```go
+bus := channelbus.NewChannelBus[string]()
+
+// Basic unbounded subscription (default slow consumer threshold: 1000)
+sub := bus.SubscribeUnbounded("events.")
+
+// With configuration
+sub := bus.SubscribeUnbounded("events.", channelbus.UnboundedConfig[string]{
+    SlowConsumerThreshold: 500,        // warn when buffer exceeds 500
+    MaxBufferSize:         10000,      // hard limit to prevent OOM (0 = no limit)
+    DropPolicy:            channelbus.DropOldest,  // or DropNewest (default)
+    OnSlowConsumer: func(s *channelbus.Subscription[string], depth int) {
+        log.Printf("slow consumer detected: buffer depth %d", depth)
+    },
+})
+
+// Monitor buffer health
+fmt.Println(sub.BufferDepth())      // current internal buffer size
+fmt.Println(sub.PeakBufferDepth())  // highest buffer depth ever observed
+fmt.Println(sub.IsUnbounded())      // true
+
+// Cleanup (also called automatically by Unsubscribe)
+sub.Close()
+```
+
+### Safety features
+- **Slow consumer detection**: Configurable threshold with callback when buffer depth crosses it.
+  The callback re-arms after the buffer drains back below the threshold.
+- **OOM protection**: Optional `MaxBufferSize` hard limit with configurable `DropPolicy`
+  (`DropOldest` or `DropNewest`). Dropped messages increment `ErrCnt()`.
+- **Observable state**: `BufferDepth()` and `PeakBufferDepth()` for monitoring/metrics.
+- **Clean shutdown**: `Close()` stops the internal drain goroutine. Called automatically by `Unsubscribe`.
+
+### When to use unbounded vs bounded
+- **Bounded** (`Subscribe`): Best for fire-and-forget notifications where occasional drops are acceptable
+  (e.g., UI refresh hints, metric events).
+- **Unbounded** (`SubscribeUnbounded`): Use when every message must be delivered (e.g., SSE streaming,
+  audit logs, command queues). Always configure `MaxBufferSize` in production to prevent runaway memory growth.
+
 # Benchmarks
 Performance scales close to linearly to two factors:
 * A small increment with the total number of subscribers (i.e. subscriptions to check).  This is the string compares.

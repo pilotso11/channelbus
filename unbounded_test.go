@@ -1,0 +1,347 @@
+package channelbus
+
+// MIT License
+//
+// Copyright (c) 2023-2026 Seth Osher
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSubscribeUnbounded_BasicDelivery(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("test.")
+	defer bus.Unsubscribe(sub)
+
+	assert.True(t, sub.IsUnbounded())
+
+	n := bus.Publish("test.hello", "message1")
+	assert.Equal(t, 1, n)
+
+	msg := <-sub.Ch
+	assert.Equal(t, "message1", msg)
+}
+
+func TestSubscribeUnbounded_NoDrops(t *testing.T) {
+	bus := NewChannelBus[string]()
+	// Use a very small channel buffer (1) to prove the internal buffer handles overflow
+	sub := bus.SubscribeUnbounded("test.")
+	defer bus.Unsubscribe(sub)
+
+	// Publish many messages without reading — they should all be buffered
+	const count = 500
+	for i := 0; i < count; i++ {
+		n := bus.Publish("test.msg", "hello")
+		assert.Equal(t, 1, n, "message %d should be accepted", i)
+	}
+
+	// Now read them all back
+	for i := 0; i < count; i++ {
+		select {
+		case msg := <-sub.Ch:
+			assert.Equal(t, "hello", msg)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for message %d", i)
+		}
+	}
+
+	assert.EqualValues(t, 0, sub.ErrCnt(), "no errors expected")
+}
+
+func TestSubscribeUnbounded_MixedWithBounded(t *testing.T) {
+	bus := NewChannelBus[string]()
+	bounded := bus.Subscribe("test.", 5)
+	unbounded := bus.SubscribeUnbounded("test.")
+	defer bus.Unsubscribe(bounded)
+	defer bus.Unsubscribe(unbounded)
+
+	assert.False(t, bounded.IsUnbounded())
+	assert.True(t, unbounded.IsUnbounded())
+
+	// Publish more than the bounded buffer can hold
+	for i := 0; i < 20; i++ {
+		bus.Publish("test.msg", "hello")
+	}
+
+	// Bounded should have dropped some
+	boundedCount := 0
+	for {
+		select {
+		case <-bounded.Ch:
+			boundedCount++
+		default:
+			goto doneBounded
+		}
+	}
+doneBounded:
+	assert.Equal(t, 5, boundedCount, "bounded should only have 5")
+	assert.EqualValues(t, 15, bounded.ErrCnt(), "bounded should have 15 drops")
+
+	// Unbounded should have all 20
+	for i := 0; i < 20; i++ {
+		select {
+		case msg := <-unbounded.Ch:
+			assert.Equal(t, "hello", msg)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for unbounded message %d", i)
+		}
+	}
+	assert.EqualValues(t, 0, unbounded.ErrCnt(), "unbounded should have no drops")
+}
+
+func TestSubscribeUnbounded_SlowConsumerCallback(t *testing.T) {
+	var callbackDepth atomic.Int64
+	var callbackCount atomic.Int64
+
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[string]{
+		SlowConsumerThreshold: 10,
+		OnSlowConsumer: func(s *Subscription[string], depth int) {
+			callbackDepth.Store(int64(depth))
+			callbackCount.Add(1)
+		},
+	})
+	defer bus.Unsubscribe(sub)
+
+	// Publish enough to trigger slow consumer
+	for i := 0; i < 15; i++ {
+		bus.Publish("test.msg", "hello")
+	}
+
+	// Wait briefly for the callback to fire
+	assert.Eventually(t, func() bool {
+		return callbackCount.Load() >= 1
+	}, 1*time.Second, 5*time.Millisecond, "slow consumer callback should fire")
+
+	assert.GreaterOrEqual(t, int(callbackDepth.Load()), 10, "callback should report depth >= threshold")
+
+	// Drain all messages to bring depth below threshold
+	for i := 0; i < 15; i++ {
+		select {
+		case <-sub.Ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out draining")
+		}
+	}
+
+	// Wait for depth to reset
+	assert.Eventually(t, func() bool {
+		return sub.BufferDepth() == 0
+	}, 1*time.Second, 5*time.Millisecond, "buffer should drain")
+
+	// Publish again to trigger another callback (should re-arm after dropping below threshold)
+	prevCount := callbackCount.Load()
+	for i := 0; i < 15; i++ {
+		bus.Publish("test.msg", "hello2")
+	}
+
+	assert.Eventually(t, func() bool {
+		return callbackCount.Load() > prevCount
+	}, 1*time.Second, 5*time.Millisecond, "slow consumer callback should re-fire after reset")
+}
+
+func TestSubscribeUnbounded_MaxBufferSize_DropNewest(t *testing.T) {
+	bus := NewChannelBus[int]()
+	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[int]{
+		MaxBufferSize:         10,
+		DropPolicy:            DropNewest,
+		SlowConsumerThreshold: 0, // disable
+	})
+	defer bus.Unsubscribe(sub)
+
+	// Publish more than MaxBufferSize
+	for i := 0; i < 20; i++ {
+		bus.Publish("test.msg", i)
+	}
+
+	// Should have errCnt for dropped messages
+	assert.Eventually(t, func() bool {
+		return sub.ErrCnt() > 0
+	}, 1*time.Second, 5*time.Millisecond, "should have drops")
+
+	// Read what we can — should be first 10 (plus maybe 1 in Ch buffer)
+	var received []int
+	for {
+		select {
+		case msg := <-sub.Ch:
+			received = append(received, msg)
+		case <-time.After(500 * time.Millisecond):
+			goto done
+		}
+	}
+done:
+	// The first messages should be the earliest ones (0, 1, 2, ...)
+	require.NotEmpty(t, received)
+	assert.Equal(t, 0, received[0], "first received should be oldest message")
+}
+
+func TestSubscribeUnbounded_MaxBufferSize_DropOldest(t *testing.T) {
+	bus := NewChannelBus[int]()
+	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[int]{
+		MaxBufferSize:         10,
+		DropPolicy:            DropOldest,
+		SlowConsumerThreshold: 0, // disable
+	})
+	defer bus.Unsubscribe(sub)
+
+	// Publish more than MaxBufferSize
+	for i := 0; i < 20; i++ {
+		bus.Publish("test.msg", i)
+	}
+
+	// Should have errCnt for dropped messages
+	assert.Eventually(t, func() bool {
+		return sub.ErrCnt() > 0
+	}, 1*time.Second, 5*time.Millisecond, "should have drops")
+
+	// Read all — the newest messages should be present
+	var received []int
+	for {
+		select {
+		case msg := <-sub.Ch:
+			received = append(received, msg)
+		case <-time.After(500 * time.Millisecond):
+			goto done
+		}
+	}
+done:
+	require.NotEmpty(t, received)
+	// Last received should be 19 (the newest)
+	assert.Equal(t, 19, received[len(received)-1], "last received should be newest message")
+}
+
+func TestSubscribeUnbounded_BufferDepthAndPeak(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[string]{
+		SlowConsumerThreshold: 0, // disable
+	})
+	defer bus.Unsubscribe(sub)
+
+	assert.Equal(t, 0, sub.BufferDepth())
+	assert.Equal(t, 0, sub.PeakBufferDepth())
+
+	// Publish a batch
+	for i := 0; i < 50; i++ {
+		bus.Publish("test.msg", "hello")
+	}
+
+	// Peak should be >= 50 (all published before any consumed)
+	assert.Eventually(t, func() bool {
+		return sub.PeakBufferDepth() >= 45 // allow some drain
+	}, 1*time.Second, 5*time.Millisecond)
+
+	// Drain all
+	for i := 0; i < 50; i++ {
+		select {
+		case <-sub.Ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out at message %d", i)
+		}
+	}
+
+	// Depth should be 0, but peak should remain high
+	assert.Eventually(t, func() bool {
+		return sub.BufferDepth() == 0
+	}, 1*time.Second, 5*time.Millisecond)
+	assert.GreaterOrEqual(t, sub.PeakBufferDepth(), 45)
+}
+
+func TestSubscribeUnbounded_BoundedBufferDepthIsZero(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.Subscribe("test.")
+	defer bus.Unsubscribe(sub)
+
+	assert.False(t, sub.IsUnbounded())
+	assert.Equal(t, 0, sub.BufferDepth())
+	assert.Equal(t, 0, sub.PeakBufferDepth())
+}
+
+func TestSubscribeUnbounded_UnsubscribeStopsDrain(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("test.")
+
+	// Publish a message
+	bus.Publish("test.msg", "hello")
+	<-sub.Ch
+
+	// Unsubscribe should stop the drain goroutine
+	assert.True(t, bus.Unsubscribe(sub))
+
+	// Publishing should no longer reach this subscription
+	n := bus.Publish("test.msg", "after-unsub")
+	assert.Equal(t, 0, n)
+}
+
+func TestSubscribeUnbounded_CloseIsIdempotent(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("test.")
+
+	sub.Close()
+	sub.Close() // should not panic
+	bus.Unsubscribe(sub)
+}
+
+func TestSubscribeUnbounded_ConcurrentPublish(t *testing.T) {
+	bus := NewChannelBus[int]()
+	sub := bus.SubscribeUnbounded("test.")
+	defer bus.Unsubscribe(sub)
+
+	const numGoroutines = 10
+	const msgsPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	for g := 0; g < numGoroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < msgsPerGoroutine; i++ {
+				bus.Publish("test.msg", i)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Should receive all messages
+	total := numGoroutines * msgsPerGoroutine
+	for i := 0; i < total; i++ {
+		select {
+		case <-sub.Ch:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for message %d/%d", i, total)
+		}
+	}
+
+	assert.EqualValues(t, 0, sub.ErrCnt())
+}
+
+func TestSubscribeUnbounded_DefaultConfig(t *testing.T) {
+	bus := NewChannelBus[string]()
+	// No config provided — should use defaults
+	sub := bus.SubscribeUnbounded("test.")
+	defer bus.Unsubscribe(sub)
+
+	bus.Publish("test.msg", "hello")
+	msg := <-sub.Ch
+	assert.Equal(t, "hello", msg)
+}
+
+func TestSubscribeUnbounded_PrefixMatching(t *testing.T) {
+	bus := NewChannelBus[string]()
+	sub := bus.SubscribeUnbounded("blue.")
+	defer bus.Unsubscribe(sub)
+
+	assert.Equal(t, 1, bus.Publish("blue.car", "yes"))
+	assert.Equal(t, 0, bus.Publish("red.car", "no"))
+	assert.Equal(t, 1, bus.Publish("blue.van", "yes2"))
+
+	msg1 := <-sub.Ch
+	assert.Equal(t, "yes", msg1)
+	msg2 := <-sub.Ch
+	assert.Equal(t, "yes2", msg2)
+}
