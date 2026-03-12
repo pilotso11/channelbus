@@ -103,10 +103,9 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	if u.config.MaxBufferSize > 0 && len(u.buf) >= u.config.MaxBufferSize {
 		switch u.config.DropPolicy {
 		case DropOldest:
-			// Copy to a new slice so the old backing array can be GC'd
-			newBuf := make([]T, len(u.buf)-1, len(u.buf))
-			copy(newBuf, u.buf[1:])
-			u.buf = append(newBuf, msg)
+			// Shift elements left in-place to reuse the backing array
+			copy(u.buf, u.buf[1:])
+			u.buf[len(u.buf)-1] = msg
 			u.sub.errCnt.Add(1)
 		case DropNewest:
 			u.sub.errCnt.Add(1)
