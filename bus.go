@@ -84,9 +84,11 @@ func (s *Subscription[T]) IsUnbounded() bool {
 	return s.unbounded != nil
 }
 
-// Close stops the internal drain goroutine for unbounded subscriptions.
-// For bounded subscriptions this is a no-op. Close is idempotent.
-// After Close, the subscription should not receive new messages.
+// Close stops the internal drain goroutine for unbounded subscriptions and
+// waits for it to exit. After Close returns, no new publishes are accepted
+// and no further sends to Ch will occur. Already-buffered messages that have
+// not been drained are discarded. For bounded subscriptions this is a no-op.
+// Close is idempotent.
 func (s *Subscription[T]) Close() {
 	if s.unbounded != nil {
 		s.unbounded.close()

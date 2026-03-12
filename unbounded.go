@@ -23,6 +23,7 @@ package channelbus
 // SOFTWARE.
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -72,6 +73,8 @@ type unboundedState[T any] struct {
 	mu       sync.Mutex
 	buf      []T
 	notifyCh chan struct{} // signals the drain goroutine that buf has items
+	cancel   context.CancelFunc
+	done     chan struct{} // closed when drain goroutine exits
 	closed   atomic.Bool
 	depth    atomic.Int64 // current buffer depth (atomic for lock-free reads)
 	peak     atomic.Int64 // peak buffer depth ever observed
@@ -144,16 +147,30 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 }
 
 // drain is the background goroutine that moves messages from buf to sub.Ch.
-func (u *unboundedState[T]) drain() {
+// It exits when the context is cancelled.
+func (u *unboundedState[T]) drain(ctx context.Context) {
+	defer close(u.done)
+
 	for {
-		// Wait for notification or close
-		_, ok := <-u.notifyCh
-		if !ok {
+		// Wait for notification or cancellation
+		select {
+		case <-ctx.Done():
 			return
+		case _, ok := <-u.notifyCh:
+			if !ok {
+				return
+			}
 		}
 
 		// Drain all available messages in batches to reduce lock contention.
 		for {
+			// Check for cancellation before processing next batch
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			// Grab all pending messages in one lock acquisition
 			u.mu.Lock()
 			if len(u.buf) == 0 {
@@ -172,18 +189,26 @@ func (u *unboundedState[T]) drain() {
 			u.depth.Store(0)
 			u.mu.Unlock()
 
-			// Send each message to the consumer (blocking — backpressure is intentional)
+			// Send each message to the consumer.
+			// Uses select with ctx.Done so Close() unblocks a stuck send.
 			for _, msg := range batch {
-				u.sub.Ch <- msg
+				select {
+				case u.sub.Ch <- msg:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}
 }
 
-// close stops the drain goroutine and releases resources.
+// close cancels the drain goroutine and waits for it to exit.
+// After close returns, no new publishes are accepted and the drain goroutine
+// has stopped. Already-buffered messages that have not been drained are discarded.
 func (u *unboundedState[T]) close() {
 	if u.closed.CompareAndSwap(false, true) {
-		close(u.notifyCh)
+		u.cancel()
+		<-u.done // wait for drain goroutine to exit
 	}
 }
 
@@ -214,8 +239,12 @@ func (b *ChannelBus[T]) SubscribeUnbounded(topic string, config ...UnboundedConf
 		Ch:     make(chan T, 1),
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	state := &unboundedState[T]{
 		notifyCh: make(chan struct{}, 1),
+		cancel:   cancel,
+		done:     make(chan struct{}),
 		config:   cfg,
 		sub:      sub,
 	}
@@ -223,7 +252,7 @@ func (b *ChannelBus[T]) SubscribeUnbounded(topic string, config ...UnboundedConf
 	sub.unbounded = state
 
 	// Start drain goroutine
-	go state.drain()
+	go state.drain(ctx)
 
 	b.subs = append(b.subs, sub)
 	return sub
