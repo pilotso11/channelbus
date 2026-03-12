@@ -33,10 +33,11 @@ import (
 type DropPolicy int
 
 const (
-	// DropOldest removes the oldest message from the buffer to make room.
-	DropOldest DropPolicy = iota
 	// DropNewest discards the incoming message (same as bounded Subscribe).
-	DropNewest
+	// This is the zero value and the default policy.
+	DropNewest DropPolicy = iota
+	// DropOldest removes the oldest message from the buffer to make room.
+	DropOldest
 )
 
 // SlowConsumerFunc is called when an unbounded subscription's internal buffer
@@ -48,16 +49,17 @@ type SlowConsumerFunc[T any] func(sub *Subscription[T], depth int)
 // UnboundedConfig configures an unbounded subscription.
 type UnboundedConfig[T any] struct {
 	// SlowConsumerThreshold is the buffer depth that triggers the
-	// OnSlowConsumer callback. Default: 1000. Set to 0 to disable.
+	// OnSlowConsumer callback. Zero value means use default (1000).
+	// Set to -1 to disable.
 	SlowConsumerThreshold int
 
 	// MaxBufferSize is the hard limit on internal buffer size.
 	// When reached, DropPolicy determines behavior.
-	// Default: 0 (no limit — truly unbounded, use with caution).
+	// Zero value means no limit (truly unbounded, use with caution).
 	MaxBufferSize int
 
 	// DropPolicy controls what happens when MaxBufferSize is reached.
-	// Default: DropNewest.
+	// Zero value (DropNewest) is the default.
 	DropPolicy DropPolicy
 
 	// OnSlowConsumer is called when the buffer depth exceeds
@@ -104,9 +106,12 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 			newBuf := make([]T, len(u.buf)-1, len(u.buf))
 			copy(newBuf, u.buf[1:])
 			u.buf = append(newBuf, msg)
-			u.depth.Store(int64(len(u.buf)))
+			// Capture depth inside mutex to avoid stale-write race with drain goroutine
+			depth := int64(len(u.buf))
+			u.depth.Store(depth)
 			u.mu.Unlock()
 			u.sub.errCnt.Add(1)
+			u.updatePeakAndNotify(depth)
 			return true
 		case DropNewest:
 			u.mu.Unlock()
@@ -116,24 +121,33 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	}
 
 	u.buf = append(u.buf, msg)
-	currentDepth := int64(len(u.buf))
-	u.depth.Store(currentDepth)
+	// Capture depth inside mutex to avoid stale-write race with drain goroutine
+	depth := int64(len(u.buf))
+	u.depth.Store(depth)
 	u.mu.Unlock()
 
+	u.updatePeakAndNotify(depth)
+	return true
+}
+
+// updatePeakAndNotify updates the peak depth, checks for slow consumers, and
+// signals the drain goroutine. Called after enqueue adds a message to the buffer.
+// depth is the buffer length captured inside the mutex.
+func (u *unboundedState[T]) updatePeakAndNotify(depth int64) {
 	// Update peak (lock-free CAS loop)
 	for {
 		oldPeak := u.peak.Load()
-		if currentDepth <= oldPeak || u.peak.CompareAndSwap(oldPeak, currentDepth) {
+		if depth <= oldPeak || u.peak.CompareAndSwap(oldPeak, depth) {
 			break
 		}
 	}
 
 	// Slow consumer detection
 	threshold := u.config.SlowConsumerThreshold
-	if threshold > 0 && currentDepth >= int64(threshold) {
+	if threshold > 0 && depth >= int64(threshold) {
 		if u.config.OnSlowConsumer != nil && !u.slowConsumerTriggered.Load() {
 			u.slowConsumerTriggered.Store(true)
-			u.config.OnSlowConsumer(u.sub, int(currentDepth))
+			u.config.OnSlowConsumer(u.sub, int(depth))
 		}
 	}
 
@@ -142,8 +156,6 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	case u.notifyCh <- struct{}{}:
 	default:
 	}
-
-	return true
 }
 
 // drain is the background goroutine that moves messages from buf to sub.Ch.
@@ -152,14 +164,12 @@ func (u *unboundedState[T]) drain(ctx context.Context) {
 	defer close(u.done)
 
 	for {
-		// Wait for notification or cancellation
+		// Wait for notification or cancellation.
+		// notifyCh is never closed; shutdown is handled by ctx cancellation.
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-u.notifyCh:
-			if !ok {
-				return
-			}
+		case <-u.notifyCh:
 		}
 
 		// Drain all available messages in batches to reduce lock contention.
@@ -228,10 +238,24 @@ func (b *ChannelBus[T]) SubscribeUnbounded(topic string, config ...UnboundedConf
 
 	cfg := UnboundedConfig[T]{
 		SlowConsumerThreshold: 1000,
-		DropPolicy:            DropNewest,
+		// DropPolicy defaults to DropNewest (zero value)
 	}
 	if len(config) > 0 {
-		cfg = config[0]
+		c := config[0]
+		// Merge provided config onto defaults. Zero values mean "use default".
+		// Use -1 for SlowConsumerThreshold to explicitly disable.
+		if c.SlowConsumerThreshold != 0 {
+			cfg.SlowConsumerThreshold = c.SlowConsumerThreshold
+		}
+		if c.MaxBufferSize != 0 {
+			cfg.MaxBufferSize = c.MaxBufferSize
+		}
+		if c.DropPolicy != 0 {
+			cfg.DropPolicy = c.DropPolicy
+		}
+		if c.OnSlowConsumer != nil {
+			cfg.OnSlowConsumer = c.OnSlowConsumer
+		}
 	}
 
 	sub := &Subscription[T]{

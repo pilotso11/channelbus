@@ -168,7 +168,7 @@ func TestSubscribeUnbounded_MaxBufferSize_DropNewest(t *testing.T) {
 	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[int]{
 		MaxBufferSize:         10,
 		DropPolicy:            DropNewest,
-		SlowConsumerThreshold: 0, // disable
+		SlowConsumerThreshold: -1, // disable
 	})
 	defer bus.Unsubscribe(sub)
 
@@ -194,7 +194,7 @@ func TestSubscribeUnbounded_MaxBufferSize_DropOldest(t *testing.T) {
 	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[int]{
 		MaxBufferSize:         10,
 		DropPolicy:            DropOldest,
-		SlowConsumerThreshold: 0, // disable
+		SlowConsumerThreshold: -1, // disable
 	})
 	defer bus.Unsubscribe(sub)
 
@@ -218,7 +218,7 @@ func TestSubscribeUnbounded_MaxBufferSize_DropOldest(t *testing.T) {
 func TestSubscribeUnbounded_BufferDepthAndPeak(t *testing.T) {
 	bus := NewChannelBus[string]()
 	sub := bus.SubscribeUnbounded("test.", UnboundedConfig[string]{
-		SlowConsumerThreshold: 0, // disable
+		SlowConsumerThreshold: -1, // disable
 	})
 	defer bus.Unsubscribe(sub)
 
