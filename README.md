@@ -74,7 +74,7 @@ sub := bus.SubscribeUnbounded("events.")
 // With configuration
 sub := bus.SubscribeUnbounded("events.", channelbus.UnboundedConfig[string]{
     SlowConsumerThreshold: 500,        // warn when buffer exceeds 500
-    MaxBufferSize:         10000,      // hard limit to prevent OOM (0 = no limit)
+    MaxBufferSize:         10000,      // limit enqueue buffer size (0 = no limit)
     DropPolicy:            channelbus.DropOldest,  // or DropNewest (default)
     OnSlowConsumer: func(s *channelbus.Subscription[string], depth int) {
         log.Printf("slow consumer detected: buffer depth %d", depth)
@@ -92,9 +92,11 @@ sub.Close()
 
 ### Safety features
 - **Slow consumer detection**: Configurable threshold with callback when buffer depth crosses it.
-  The callback re-arms after the buffer drains back below the threshold.
-- **OOM protection**: Optional `MaxBufferSize` hard limit with configurable `DropPolicy`
-  (`DropOldest` or `DropNewest`). Dropped messages increment `ErrCnt()`.
+  The callback re-arms once the buffer is fully drained, firing at most once per slow episode.
+- **Buffer size limit**: Optional `MaxBufferSize` limits the internal enqueue buffer. When reached,
+  `DropPolicy` determines whether the oldest or newest message is discarded. Note: the drain
+  goroutine processes messages in batches, so total in-flight messages (enqueue buffer + batch
+  being delivered) may briefly exceed `MaxBufferSize`. Dropped messages increment `ErrCnt()`.
 - **Observable state**: `BufferDepth()` and `PeakBufferDepth()` for monitoring/metrics.
 - **Clean shutdown**: `Close()` stops the internal drain goroutine. Called automatically by `Unsubscribe`.
 

@@ -16,12 +16,18 @@ import (
 
 // drainChan reads all available messages from ch until no message arrives within timeout.
 func drainChan[T any](ch <-chan T, timeout time.Duration) []T {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	var result []T
 	for {
 		select {
 		case msg := <-ch:
 			result = append(result, msg)
-		case <-time.After(timeout):
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(timeout)
+		case <-timer.C:
 			return result
 		}
 	}

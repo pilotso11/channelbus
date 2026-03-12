@@ -53,8 +53,9 @@ type UnboundedConfig[T any] struct {
 	// Set to -1 to disable.
 	SlowConsumerThreshold int
 
-	// MaxBufferSize is the hard limit on internal buffer size.
-	// When reached, DropPolicy determines behavior.
+	// MaxBufferSize limits the internal enqueue buffer. When reached,
+	// DropPolicy determines behavior. Note: total in-flight messages may
+	// briefly exceed this while the drain goroutine delivers a batch.
 	// Zero value means no limit (truly unbounded, use with caution).
 	MaxBufferSize int
 
@@ -64,8 +65,8 @@ type UnboundedConfig[T any] struct {
 
 	// OnSlowConsumer is called when the buffer depth exceeds
 	// SlowConsumerThreshold. Called in a separate goroutine so it
-	// will not block publishers. May be called multiple times (each
-	// time depth crosses the threshold after dropping back below it).
+	// will not block publishers. The callback re-arms once the buffer
+	// is fully drained, so it fires at most once per slow episode.
 	OnSlowConsumer SlowConsumerFunc[T]
 }
 
