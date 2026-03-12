@@ -134,16 +134,20 @@ func (b *ChannelBus[T]) Subscribe(topic string, bufferSize ...int) *Subscription
 // For unbounded subscriptions, this also stops the internal drain goroutine.
 func (b *ChannelBus[T]) Unsubscribe(subscription *Subscription[T]) bool {
 	b.lock.Lock()
-	defer b.lock.Unlock()
-
-	// Remove the subscription from the list
+	// Remove the subscription from the list while holding the lock
 	newSubs := remove(b.subs, subscription)
-	if len(newSubs) < len(b.subs) {
+	found := len(newSubs) < len(b.subs)
+	if found {
 		b.subs = newSubs
-		subscription.Close()
-		return true
 	}
-	return false
+	b.lock.Unlock()
+
+	// Close outside the lock so the drain goroutine's shutdown
+	// doesn't block concurrent Publish/Subscribe calls.
+	if found {
+		subscription.Close()
+	}
+	return found
 }
 
 // Publish a message of type T to all subscribers channels whose Prefix matches topic.
