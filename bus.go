@@ -69,8 +69,9 @@ func (s *Subscription[T]) BufferDepth() int {
 	return int(s.unbounded.depth.Load())
 }
 
-// PeakBufferDepth returns the highest buffer depth ever observed for unbounded
-// subscriptions. Returns 0 for bounded subscriptions.
+// PeakBufferDepth returns the highest internal buffer depth ever observed.
+// Only tracked for unbounded subscriptions; returns 0 for bounded
+// (tracking peak for bounded would add overhead to the zero-allocation publish path).
 func (s *Subscription[T]) PeakBufferDepth() int {
 	if s.unbounded == nil {
 		return 0
