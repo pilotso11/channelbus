@@ -97,6 +97,7 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 	}
 
 	u.mu.Lock()
+	defer u.mu.Unlock()
 
 	// Check hard limit
 	if u.config.MaxBufferSize > 0 && len(u.buf) >= u.config.MaxBufferSize {
@@ -106,22 +107,16 @@ func (u *unboundedState[T]) enqueue(msg T) bool {
 			newBuf := make([]T, len(u.buf)-1, len(u.buf))
 			copy(newBuf, u.buf[1:])
 			u.buf = append(newBuf, msg)
-			depth := u.updateDepthAndPeak()
-			u.mu.Unlock()
 			u.sub.errCnt.Add(1)
-			u.notifyAndCheckSlowConsumer(depth)
-			return true
 		case DropNewest:
-			u.mu.Unlock()
 			u.sub.errCnt.Add(1)
 			return false
 		}
+	} else {
+		u.buf = append(u.buf, msg)
 	}
 
-	u.buf = append(u.buf, msg)
 	depth := u.updateDepthAndPeak()
-	u.mu.Unlock()
-
 	u.notifyAndCheckSlowConsumer(depth)
 	return true
 }
